@@ -1,4 +1,5 @@
-//! DDS, KTX and KTX2 textures: the top mip of the first face / layer / slice, as RGBA.
+//! DDS, KTX and KTX2 textures: the top mip of the first layer / slice, as RGBA. Cubemaps
+//! unfold into a horizontal cross.
 //! HDR formats are clamped to [0, 1]; sRGB is shown as stored.
 use std::io::Read;
 use std::path::Path;
@@ -15,7 +16,8 @@ const KTX2: &[u8] = b"\xabKTX 20\xbb\r\n\x1a\n";
 type Blocks = fn(&[u8], usize, usize, &mut [u32]) -> Result<(), &'static str>;
 
 enum Fmt {
-    Block(Blocks),
+    /// 4x4 blocks of `bytes` each.
+    Block(Blocks, usize),
     Astc(usize, usize),
     /// Uncompressed: bytes per pixel, pixel -> RGBA.
     Raw(usize, fn(&[u8]) -> [u8; 4]),
@@ -30,6 +32,19 @@ struct Tex<'a> {
     data: &'a [u8],
     /// KTX1 pads uncompressed rows to 4 bytes.
     row_align: usize,
+    /// 6 for a cubemap, else 1; `stride` bytes apart in `data`.
+    faces: usize,
+    stride: usize,
+}
+
+impl Fmt {
+    fn size(&self, w: usize, h: usize) -> usize {
+        match *self {
+            Fmt::Block(_, bytes) => w.div_ceil(4) * h.div_ceil(4) * bytes,
+            Fmt::Astc(bw, bh) => w.div_ceil(bw) * h.div_ceil(bh) * 16,
+            Fmt::Raw(bytes, _) | Fmt::Masks { bytes, .. } => w * h * bytes,
+        }
+    }
 }
 
 fn u32at(b: &[u8], o: usize) -> u32 {
@@ -60,21 +75,40 @@ pub fn decode(path: &Path) -> Result<DynamicImage, String> {
     } else {
         return Err("not a DDS or KTX file".into());
     };
-    tex.rgba().map(DynamicImage::ImageRgba8)
+    unfold((0..tex.faces).map(|i| tex.face(i)).collect::<Result<_, _>>()?)
+}
+
+/// Cubemap faces (+X -X +Y -Y +Z -Z) as a horizontal cross; a single image as is.
+fn unfold(mut faces: Vec<RgbaImage>) -> Result<DynamicImage, String> {
+    if faces.len() != 6 {
+        return faces.pop().map(DynamicImage::ImageRgba8).ok_or_else(|| "no image".into());
+    }
+    let (w, h) = faces[0].dimensions();
+    let mut out = RgbaImage::new(w * 4, h * 3);
+    for (f, (c, r)) in faces.iter().zip([(2, 1), (0, 1), (1, 0), (1, 2), (1, 1), (3, 1)]) {
+        image::imageops::replace(&mut out, f, (c * w) as i64, (r * h) as i64);
+    }
+    Ok(DynamicImage::ImageRgba8(out))
 }
 
 fn basis(b: &[u8]) -> Result<DynamicImage, String> {
     let t = basisu::Transcoder::new(b).map_err(|e| format!("basis: {e:?}"))?;
     let (w, h) = t.base_dimensions();
-    let px = t
-        .transcode_image(0, 0, 0, basisu::TargetFormat::Rgba32, basisu::DecodeFlags::NONE)
-        .map_err(|e| format!("basis: {e:?}"))?;
-    RgbaImage::from_raw(w, h, px).map(DynamicImage::ImageRgba8).ok_or_else(|| "basis: short output".into())
+    let faces = (0..t.face_count())
+        .map(|f| {
+            let px = t
+                .transcode_image(0, 0, f, basisu::TargetFormat::Rgba32, basisu::DecodeFlags::NONE)
+                .map_err(|e| format!("basis: {e:?}"))?;
+            RgbaImage::from_raw(w, h, px).ok_or_else(|| "basis: short output".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    unfold(faces)
 }
 
 impl Tex<'_> {
-    fn rgba(&self) -> Result<RgbaImage, String> {
+    fn face(&self, i: usize) -> Result<RgbaImage, String> {
         let (w, h) = (self.w, self.h);
+        let data = self.data.get(i * self.stride..).ok_or("truncated")?;
         if w == 0 || h == 0 || w > 16384 || h > 16384 {
             return Err(format!("unsupported size {w}×{h}"));
         }
@@ -93,7 +127,7 @@ impl Tex<'_> {
             Ok(())
         };
         match &self.fmt {
-            Fmt::Raw(bytes, f) => px(self.data, f, *bytes, &mut out)?,
+            Fmt::Raw(bytes, f) => px(data, f, *bytes, &mut out)?,
             Fmt::Masks { bytes, m, lum } => {
                 let f = |p: &[u8]| {
                     let mut v = [0u8; 4];
@@ -110,13 +144,13 @@ impl Tex<'_> {
                     let (g, b) = if *lum { (r, r) } else { (ch(m[1], 0), ch(m[2], 0)) };
                     [r, g, b, ch(m[3], 255)]
                 };
-                px(self.data, &f, *bytes, &mut out)?
+                px(data, &f, *bytes, &mut out)?
             }
             Fmt::Block(..) | Fmt::Astc(..) => {
                 let mut buf = vec![0u32; w * h];
                 match self.fmt {
-                    Fmt::Block(f) => f(self.data, w, h, &mut buf),
-                    Fmt::Astc(bw, bh) => t2d::decode_astc(self.data, w, h, bw, bh, &mut buf),
+                    Fmt::Block(f, _) => f(data, w, h, &mut buf),
+                    Fmt::Astc(bw, bh) => t2d::decode_astc(data, w, h, bw, bh, &mut buf),
                     _ => unreachable!(),
                 }?;
                 // The decoders write BGRA.
@@ -202,16 +236,17 @@ fn dds(b: &[u8]) -> Result<Tex<'_>, String> {
     let (h, w) = (u32at(b, 12) as usize, u32at(b, 16) as usize);
     let (flags, fourcc) = (u32at(b, 80), &b[84..88]);
     let mut start = 128;
+    let mut cube = u32at(b, 112) & 0xfe00 == 0xfe00;
     let fmt = if flags & 0x4 != 0 {
         match fourcc {
-            b"DXT1" => Fmt::Block(t2d::decode_bc1),
-            b"DXT2" | b"DXT3" => Fmt::Block(t2d::decode_bc2),
-            b"DXT4" | b"DXT5" => Fmt::Block(t2d::decode_bc3),
-            b"ATI1" | b"BC4U" => Fmt::Block(t2d::decode_bc4),
-            b"ATI2" | b"BC5U" => Fmt::Block(t2d::decode_bc5),
-            b"ATC " => Fmt::Block(t2d::decode_atc_rgb4),
-            b"ATCI" => Fmt::Block(t2d::decode_atc_rgba8),
-            b"ATCA" | b"ATCE" => Fmt::Block(atce),
+            b"DXT1" => Fmt::Block(t2d::decode_bc1, 8),
+            b"DXT2" | b"DXT3" => Fmt::Block(t2d::decode_bc2, 16),
+            b"DXT4" | b"DXT5" => Fmt::Block(t2d::decode_bc3, 16),
+            b"ATI1" | b"BC4U" => Fmt::Block(t2d::decode_bc4, 8),
+            b"ATI2" | b"BC5U" => Fmt::Block(t2d::decode_bc5, 16),
+            b"ATC " => Fmt::Block(t2d::decode_atc_rgb4, 8),
+            b"ATCI" => Fmt::Block(t2d::decode_atc_rgba8, 16),
+            b"ATCA" | b"ATCE" => Fmt::Block(atce, 16),
             // bimg's own ASTC codes; ':' is the digit after '9'.
             b"AS44" => Fmt::Astc(4, 4),
             b"AS55" => Fmt::Astc(5, 5),
@@ -221,6 +256,7 @@ fn dds(b: &[u8]) -> Result<Tex<'_>, String> {
             b"AS:5" => Fmt::Astc(10, 5),
             b"DX10" => {
                 start = 148;
+                cube = u32at(b, 136) & 0x4 != 0;
                 dxgi(u32at(b, 128))?
             }
             // D3DFMT codes stored as numbers.
@@ -236,7 +272,10 @@ fn dds(b: &[u8]) -> Result<Tex<'_>, String> {
         let a = if flags & 0x3 != 0 { u32at(b, 104) } else { 0 };
         Fmt::Masks { bytes: bits / 8, m: [u32at(b, 92), u32at(b, 96), u32at(b, 100), a], lum: flags & 0x20000 != 0 }
     };
-    Ok(Tex { w, h, fmt, data: tail(b, start)?, row_align: 1 })
+    // Each face carries its whole mip chain.
+    let mips = if u32at(b, 8) & 0x20000 != 0 { u32at(b, 28).clamp(1, 32) } else { 1 };
+    let stride = (0..mips).map(|k| fmt.size((w >> k).max(1), (h >> k).max(1))).sum();
+    Ok(Tex { w, h, fmt, data: tail(b, start)?, row_align: 1, faces: if cube { 6 } else { 1 }, stride })
 }
 
 fn dxgi(f: u32) -> Result<Fmt, String> {
@@ -247,14 +286,14 @@ fn dxgi(f: u32) -> Result<Fmt, String> {
         49 => Fmt::Raw(2, rg8),
         61 => Fmt::Raw(1, r8),
         87 | 91 => Fmt::Raw(4, bgra8),
-        70..=72 => Fmt::Block(t2d::decode_bc1),
-        73..=75 => Fmt::Block(t2d::decode_bc2),
-        76..=78 => Fmt::Block(t2d::decode_bc3),
-        79 | 80 => Fmt::Block(t2d::decode_bc4),
-        82 | 83 => Fmt::Block(t2d::decode_bc5),
-        95 => Fmt::Block(bc6u),
-        96 => Fmt::Block(bc6s),
-        97..=99 => Fmt::Block(t2d::decode_bc7),
+        70..=72 => Fmt::Block(t2d::decode_bc1, 8),
+        73..=75 => Fmt::Block(t2d::decode_bc2, 16),
+        76..=78 => Fmt::Block(t2d::decode_bc3, 16),
+        79 | 80 => Fmt::Block(t2d::decode_bc4, 8),
+        82 | 83 => Fmt::Block(t2d::decode_bc5, 16),
+        95 => Fmt::Block(bc6u, 16),
+        96 => Fmt::Block(bc6s, 16),
+        97..=99 => Fmt::Block(t2d::decode_bc7, 16),
         _ => return Err(format!("unsupported DXGI format {f}")),
     })
 }
@@ -268,22 +307,22 @@ fn ktx1(b: &[u8]) -> Result<Tex<'_>, String> {
     }
     let gl = u32at(b, 28);
     let fmt = match gl {
-        0x83f0 | 0x8c4c => Fmt::Block(t2d::decode_bc1),
-        0x83f1 | 0x8c4d => Fmt::Block(t2d::decode_bc1a),
-        0x83f2 | 0x8c4e => Fmt::Block(t2d::decode_bc2),
-        0x83f3 | 0x8c4f => Fmt::Block(t2d::decode_bc3),
-        0x8dbb => Fmt::Block(t2d::decode_bc4),
-        0x8dbd => Fmt::Block(t2d::decode_bc5),
-        0x8c72 => Fmt::Block(latc2),
-        0x8e8c | 0x8e8d => Fmt::Block(t2d::decode_bc7),
-        0x8e8e => Fmt::Block(bc6s),
-        0x8e8f => Fmt::Block(bc6u),
-        0x8d64 => Fmt::Block(t2d::decode_etc1),
-        0x9270 => Fmt::Block(t2d::decode_eacr),
-        0x9272 => Fmt::Block(t2d::decode_eacrg),
-        0x9274 | 0x9275 => Fmt::Block(t2d::decode_etc2_rgb),
-        0x9276 | 0x9277 => Fmt::Block(t2d::decode_etc2_rgba1),
-        0x9278 | 0x9279 => Fmt::Block(t2d::decode_etc2_rgba8),
+        0x83f0 | 0x8c4c => Fmt::Block(t2d::decode_bc1, 8),
+        0x83f1 | 0x8c4d => Fmt::Block(t2d::decode_bc1a, 8),
+        0x83f2 | 0x8c4e => Fmt::Block(t2d::decode_bc2, 16),
+        0x83f3 | 0x8c4f => Fmt::Block(t2d::decode_bc3, 16),
+        0x8dbb => Fmt::Block(t2d::decode_bc4, 8),
+        0x8dbd => Fmt::Block(t2d::decode_bc5, 16),
+        0x8c72 => Fmt::Block(latc2, 16),
+        0x8e8c | 0x8e8d => Fmt::Block(t2d::decode_bc7, 16),
+        0x8e8e => Fmt::Block(bc6s, 16),
+        0x8e8f => Fmt::Block(bc6u, 16),
+        0x8d64 => Fmt::Block(t2d::decode_etc1, 8),
+        0x9270 => Fmt::Block(t2d::decode_eacr, 8),
+        0x9272 => Fmt::Block(t2d::decode_eacrg, 16),
+        0x9274 | 0x9275 => Fmt::Block(t2d::decode_etc2_rgb, 8),
+        0x9276 | 0x9277 => Fmt::Block(t2d::decode_etc2_rgba1, 8),
+        0x9278 | 0x9279 => Fmt::Block(t2d::decode_etc2_rgba8, 16),
         0x93b0..=0x93bd => {
             let (bw, bh) = ASTC[(gl - 0x93b0) as usize];
             Fmt::Astc(bw, bh)
@@ -300,9 +339,14 @@ fn ktx1(b: &[u8]) -> Result<Tex<'_>, String> {
         0x8814 => Fmt::Raw(16, rgba32f),
         _ => return Err(format!("unsupported KTX format 0x{gl:04x}")),
     };
-    // Header, key/value data, then level 0's imageSize.
+    // Header, key/value data, then level 0's imageSize: one face, or the whole
+    // level for arrays.
     let start = 64 + u32at(b, 60) as usize + 4;
-    Ok(Tex { w: u32at(b, 36) as usize, h: (u32at(b, 40) as usize).max(1), fmt, data: tail(b, start)?, row_align: 4 })
+    let (size, layers) = (u32at(b, start - 4) as usize, u32at(b, 48) as usize);
+    let cube = u32at(b, 52) == 6;
+    let stride = if layers > 0 { size / (layers * if cube { 6 } else { 1 }) } else { size.next_multiple_of(4) };
+    let (w, h) = (u32at(b, 36) as usize, (u32at(b, 40) as usize).max(1));
+    Ok(Tex { w, h, fmt, data: tail(b, start)?, row_align: 4, faces: if cube { 6 } else { 1 }, stride })
 }
 
 fn ktx2<'a>(b: &'a [u8], owned: &'a mut Vec<u8>) -> Result<Tex<'a>, String> {
@@ -318,20 +362,20 @@ fn ktx2<'a>(b: &'a [u8], owned: &'a mut Vec<u8>) -> Result<Tex<'a>, String> {
         44 | 50 => Fmt::Raw(4, bgra8),
         97 => Fmt::Raw(8, rgba16f),
         109 => Fmt::Raw(16, rgba32f),
-        131 | 132 => Fmt::Block(t2d::decode_bc1),
-        133 | 134 => Fmt::Block(t2d::decode_bc1a),
-        135 | 136 => Fmt::Block(t2d::decode_bc2),
-        137 | 138 => Fmt::Block(t2d::decode_bc3),
-        139 => Fmt::Block(t2d::decode_bc4),
-        141 => Fmt::Block(t2d::decode_bc5),
-        143 => Fmt::Block(bc6u),
-        144 => Fmt::Block(bc6s),
-        145 | 146 => Fmt::Block(t2d::decode_bc7),
-        147 | 148 => Fmt::Block(t2d::decode_etc2_rgb),
-        149 | 150 => Fmt::Block(t2d::decode_etc2_rgba1),
-        151 | 152 => Fmt::Block(t2d::decode_etc2_rgba8),
-        153 => Fmt::Block(t2d::decode_eacr),
-        155 => Fmt::Block(t2d::decode_eacrg),
+        131 | 132 => Fmt::Block(t2d::decode_bc1, 8),
+        133 | 134 => Fmt::Block(t2d::decode_bc1a, 8),
+        135 | 136 => Fmt::Block(t2d::decode_bc2, 16),
+        137 | 138 => Fmt::Block(t2d::decode_bc3, 16),
+        139 => Fmt::Block(t2d::decode_bc4, 8),
+        141 => Fmt::Block(t2d::decode_bc5, 16),
+        143 => Fmt::Block(bc6u, 16),
+        144 => Fmt::Block(bc6s, 16),
+        145 | 146 => Fmt::Block(t2d::decode_bc7, 16),
+        147 | 148 => Fmt::Block(t2d::decode_etc2_rgb, 8),
+        149 | 150 => Fmt::Block(t2d::decode_etc2_rgba1, 8),
+        151 | 152 => Fmt::Block(t2d::decode_etc2_rgba8, 16),
+        153 => Fmt::Block(t2d::decode_eacr, 8),
+        155 => Fmt::Block(t2d::decode_eacrg, 16),
         157..=184 => {
             let (bw, bh) = ASTC[(vk - 157) as usize / 2];
             Fmt::Astc(bw, bh)
@@ -352,7 +396,11 @@ fn ktx2<'a>(b: &'a [u8], owned: &'a mut Vec<u8>) -> Result<Tex<'a>, String> {
         }
         _ => return Err(format!("unsupported KTX2 supercompression {scheme}")),
     };
-    Ok(Tex { w: u32at(b, 20) as usize, h: (u32at(b, 24) as usize).max(1), fmt, data, row_align: 1 })
+    // Level data is layer-major, then face.
+    let (faces, layers) = (u32at(b, 36).max(1) as usize, u32at(b, 32).max(1) as usize);
+    let stride = data.len() / (faces * layers);
+    let (w, h) = (u32at(b, 20) as usize, (u32at(b, 24) as usize).max(1));
+    Ok(Tex { w, h, fmt, data, row_align: 1, faces: if faces == 6 { 6 } else { 1 }, stride })
 }
 
 #[cfg(test)]
@@ -413,6 +461,28 @@ mod tests {
         b.extend_from_slice(&[10, 20, 30, 0, 40, 50, 60, 0]);
         let img = decode(&write("rgb.ktx", &b)).unwrap();
         assert_eq!(px(&img, 0, 1), [40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn ktx1_cubemap_unfolds_to_a_cross() {
+        let mut b = vec![0u8; 64];
+        b[..12].copy_from_slice(KTX1);
+        b[12..16].copy_from_slice(&0x0403_0201u32.to_le_bytes());
+        b[28..32].copy_from_slice(&0x8058u32.to_le_bytes());
+        b[36..40].copy_from_slice(&1u32.to_le_bytes());
+        b[40..44].copy_from_slice(&1u32.to_le_bytes());
+        b[52..56].copy_from_slice(&6u32.to_le_bytes());
+        b.extend_from_slice(&4u32.to_le_bytes());
+        for f in 0..6u8 {
+            b.extend_from_slice(&[f * 40, 0, 0, 255]);
+        }
+        let img = decode(&write("cube.ktx", &b)).unwrap();
+        assert_eq!((img.width(), img.height()), (4, 3));
+        // +X, -X, +Y, -Y, +Z, -Z
+        for (f, (x, y)) in [(2, 1), (0, 1), (1, 0), (1, 2), (1, 1), (3, 1)].into_iter().enumerate() {
+            assert_eq!(px(&img, x, y), [f as u8 * 40, 0, 0, 255]);
+        }
+        assert_eq!(px(&img, 0, 0)[3], 0);
     }
 
     #[test]
