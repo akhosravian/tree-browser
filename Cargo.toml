@@ -13,9 +13,13 @@ exclude = ["/demo"]
 
 [dependencies]
 ansi-to-tui = "7"
+basisu = "0.1.0"
 crossterm = "0.28"
+half = "2.7.1"
 image = "0.25"
 libc = "0.2"
 ratatui = "0.29"
 ratatui-image = "8"
+ruzstd = "0.7"
+texture2ddecoder = "0.1.2"
 unicode-width = "0.2"

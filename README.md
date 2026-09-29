@@ -131,7 +131,12 @@ source /path/to/tree-browser/tb.bash
 ## Image and PDF previews
 
 Images (png, jpg, gif, webp, bmp, tiff, ico, svg, avif, heic, …) and PDFs preview as pictures, PDFs one
-page at a time. tb uses whatever graphics protocol the terminal answers to at startup:
+page at a time.
+
+GPU textures (`.dds`, `.ktx`, `.ktx2`) preview their top mip level, first face or layer. Supported:
+BC1–BC7, ETC1/ETC2/EAC, ASTC (LDR), ATC, LATC, Basis Universal (ETC1S, UASTC), and uncompressed
+8-bit, half- and full-float formats, with or without KTX2 zstd supercompression. HDR values are
+clamped to [0, 1]. tb uses whatever graphics protocol the terminal answers to at startup:
 
 | Terminal | Protocol |
 |---|---|

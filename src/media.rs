@@ -1,4 +1,4 @@
-//! Image and PDF previews. Pixels go through ratatui-image, which uses kitty /
+//! Image, texture and PDF previews. Pixels go through ratatui-image, which uses kitty /
 //! sixel / iTerm2 graphics when the terminal answers the query, half-blocks otherwise.
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,6 +9,8 @@ use ratatui::Frame;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{FilterType, Resize, StatefulImage};
+
+use crate::texture;
 
 /// Extensions previewed as pictures. Anything the image crate can't decode goes
 /// through ImageMagick (svg, ico, heic, ...).
@@ -102,7 +104,7 @@ impl Media {
     pub fn open(path: &Path) -> Option<Media> {
         let e = ext(path);
         let pdf = e == "pdf";
-        if !pdf && !IMAGE_EXT.contains(&e.as_str()) {
+        if !pdf && !IMAGE_EXT.contains(&e.as_str()) && !texture::EXT.contains(&e.as_str()) {
             return None;
         }
         let mut m =
@@ -163,6 +165,8 @@ impl Media {
                     .arg(&self.path),
             )
             .map_err(|e| format!("pdftoppm: {e}"))?
+        } else if texture::EXT.contains(&ext(&self.path).as_str()) {
+            return texture::decode(&self.path);
         } else {
             let direct = (!ext(&self.path).starts_with("svg"))
                 .then(|| image::ImageReader::open(&self.path).ok()?.with_guessed_format().ok()?.decode().ok())

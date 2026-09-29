@@ -7,6 +7,7 @@ mod layout;
 mod media;
 mod mtime;
 mod shell;
+mod texture;
 mod tree;
 mod ui;
 
