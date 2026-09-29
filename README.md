@@ -6,7 +6,7 @@
 The tree grows left → right, every folder you open fans out as a new column,
 and color tells you where work happened recently.
 
-[![CI](https://github.com/freakinfrick/tree-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/freakinfrick/tree-browser/actions/workflows/ci.yml)
+[![CI](https://github.com/akhosravian/tree-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/akhosravian/tree-browser/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org)
 ![Linux | macOS](https://img.shields.io/badge/platform-linux%20%7C%20macOS-lightgrey)
@@ -35,13 +35,13 @@ and color tells you where work happened recently.
 ## Install
 
 ```sh
-cargo install --git https://github.com/freakinfrick/tree-browser
+cargo install --git https://github.com/akhosravian/tree-browser
 ```
 
 or from a clone:
 
 ```sh
-git clone https://github.com/freakinfrick/tree-browser
+git clone https://github.com/akhosravian/tree-browser
 cd tree-browser
 cargo install --path .     # puts `tb` in ~/.cargo/bin
 ```
