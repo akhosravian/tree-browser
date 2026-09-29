@@ -532,7 +532,7 @@ fn prompt_bar(f: &mut Frame, app: &App, area: Rect, line: &str) {
 /// `/` query: `/ text█`, plus "no match" when nothing in the column contains it.
 fn search_bar(f: &mut Frame, app: &App, area: Rect, q: &str) {
     let miss = !q.is_empty() && app.find(q).is_none();
-    let hint = if miss { "  no match · esc back " } else { "  enter keep · esc back · n N next " };
+    let hint = if miss { "  no match · esc back " } else { "  enter open · esc back · n N next " };
     let spans = vec![
         Span::styled(" / ", Style::new().fg(to_color(LINE_ROUTE)).add_modifier(Modifier::BOLD)),
         Span::styled(q, Style::new().fg(to_color(ROUTE_TEXT))),

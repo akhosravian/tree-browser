@@ -73,8 +73,8 @@ pub struct App {
     pub prompt: Option<String>,
     /// `/` query being typed; None = closed.
     pub search: Option<Search>,
-    /// Last confirmed query, for n / N.
-    last_search: String,
+    /// Last confirmed query and the folder whose column it searched, for n / N.
+    last_search: Option<(String, Option<usize>)>,
     history: Vec<String>,
     /// Steps back into history (0 = the fresh line).
     hist_at: usize,
@@ -135,7 +135,7 @@ impl App {
             repaint: false,
             prompt: None,
             search: None,
-            last_search: String::new(),
+            last_search: None,
             history: Vec::new(),
             hist_at: 0,
             pending: None,
@@ -302,28 +302,31 @@ impl App {
     }
 
     /// Entries in the cursor's column whose name contains `q`, case-insensitively.
-    fn matches(&self, q: &str) -> Vec<usize> {
+    fn matches(&self, q: &str, col: &[usize]) -> Vec<usize> {
         let q = q.to_lowercase();
-        self.siblings().into_iter().filter(|&k| self.tree.nodes[k].name.to_lowercase().contains(&q)).collect()
+        col.iter().copied().filter(|&k| self.tree.nodes[k].name.to_lowercase().contains(&q)).collect()
     }
 
     /// Where typing `q` lands: the first name starting with it, else the first containing it.
     pub fn find(&self, q: &str) -> Option<usize> {
-        let m = self.matches(q);
+        let m = self.matches(q, &self.siblings());
         let lq = q.to_lowercase();
         m.iter().copied().find(|&k| self.tree.nodes[k].name.to_lowercase().starts_with(&lq)).or(m.first().copied())
     }
 
-    /// n / N: next or previous match after the cursor, wrapping.
+    /// n / N: next or previous match in the searched column, wrapping. Enter moved the
+    /// cursor into the match, so its entry in that column is the cursor's ancestor there.
     fn find_next(&mut self, dir: isize) {
-        let m = self.matches(&self.last_search);
-        if self.last_search.is_empty() || m.is_empty() {
-            return;
-        }
-        let sib = self.siblings();
-        let at = |id| sib.iter().position(|&s| s == id).unwrap_or(0) as isize;
-        let (cur, n) = (at(self.cursor), sib.len() as isize);
-        let next = m.iter().copied().min_by_key(|&k| {
+        let Some((q, col)) = self.last_search.clone() else { return };
+        let path = self.tree.path_to(self.cursor);
+        let under = |c| path.iter().position(|&a| a == c).and_then(|i| path.get(i + 1).copied());
+        let (list, cur) = match col.and_then(|c| under(c).map(|e| (self.tree.kids(c), e))) {
+            Some(found) => found,
+            None => (self.siblings(), self.cursor),
+        };
+        let at = |id| list.iter().position(|&s| s == id).unwrap_or(0) as isize;
+        let (cur, n) = (at(cur), list.len() as isize);
+        let next = self.matches(&q, &list).into_iter().min_by_key(|&k| {
             let d = (at(k) - cur) * dir;
             if d > 0 { d } else { d + n }
         });
@@ -338,11 +341,14 @@ impl App {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         let origin = s.origin;
         match code {
+            // Open what the query landed on, as Enter would.
             KeyCode::Enter => {
-                if !s.query.is_empty() {
-                    self.last_search = s.query.clone();
-                }
+                let q = std::mem::take(&mut s.query);
                 self.search = None;
+                if !q.is_empty() && self.find(&q).is_some() {
+                    self.last_search = Some((q, self.tree.nodes[self.cursor].parent));
+                    self.enter();
+                }
                 return;
             }
             KeyCode::Esc => self.search = None,
@@ -664,8 +670,8 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn app_in(files: &[&str]) -> App {
-        let root = std::env::temp_dir().join(format!("tb-search-{}", std::process::id()));
+    fn app_in(name: &str, files: &[&str]) -> App {
+        let root = std::env::temp_dir().join(format!("tb-search-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("d")).unwrap();
         for f in files {
@@ -686,7 +692,7 @@ mod tests {
 
     #[test]
     fn search_follows_typing_prefers_prefix_and_cycles() {
-        let mut app = app_in(&["alpha", "beta", "Bravo.txt", "zebra-b"]);
+        let mut app = app_in("cycle", &["alpha", "beta", "Bravo.txt", "zebra-b"]);
         assert_eq!(at(&app), "alpha");
         typed(&mut app, "/b");
         assert_eq!(at(&app), "beta");
@@ -701,6 +707,7 @@ mod tests {
         typed(&mut app, "/b");
         app.key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(at(&app), "beta");
+        assert!(app.preview.take().is_some(), "enter opens the match");
         typed(&mut app, "n");
         assert_eq!(at(&app), "Bravo.txt");
         typed(&mut app, "n");
@@ -709,5 +716,33 @@ mod tests {
         assert_eq!(at(&app), "beta", "wraps");
         typed(&mut app, "N");
         assert_eq!(at(&app), "zebra-b");
+    }
+
+    #[test]
+    fn search_enter_opens_a_folder() {
+        let mut app = app_in("open", &["alpha"]);
+        let d = app.tree.nodes[app.cursor].path.parent().unwrap().join("sub");
+        fs::create_dir_all(d.join("inner")).unwrap();
+        app.reload();
+        typed(&mut app, "/su");
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(at(&app), "inner");
+    }
+
+    #[test]
+    fn n_cycles_the_searched_column_not_the_opened_folder() {
+        let mut app = app_in("scope", &["bar", "zed"]);
+        let d = app.tree.nodes[app.cursor].path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(d.join("ba-dir")).unwrap();
+        fs::write(d.join("ba-dir/ba-one"), "").unwrap();
+        fs::write(d.join("ba-dir/ba-two"), "").unwrap();
+        app.reload();
+        typed(&mut app, "/ba");
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(at(&app), "ba-one");
+        typed(&mut app, "n");
+        assert_eq!(at(&app), "bar", "back in the searched column, past ba-dir");
+        typed(&mut app, "N");
+        assert_eq!(at(&app), "ba-dir");
     }
 }
